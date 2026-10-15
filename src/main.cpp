@@ -5,6 +5,9 @@
 //   Button click : run / stop
 //   Button hold  : next duty preset
 //   Serial       : "g" run, "s" stop, "f" forward, "r" reverse, "0".."255" duty
+//                  "p HI LO" duty HI for the first half turn and LO for the second, "p" off
+//                  "c" record a timestamp at every encoder edge, "d" dump the record as CSV
+//                  "b 1" brake during PWM off-time, "b 0" coast (default)
 
 namespace {
 constexpr uint8_t kMotorForwardPin = 2;  // Grove yellow: MF
@@ -37,6 +40,12 @@ constexpr uint32_t kHoldMs = 800;
 // Counts per output-shaft revolution (x4 quadrature). 0 = unknown, show counts/s only.
 // Measured 2026-10-15: 10 crank turns by hand = 2713 counts.
 constexpr int32_t kEncoderCountsPerRev = 271;
+// Second run gave 2710; the profile uses the mean so the half-turn boundary drifts less.
+constexpr float kEncoderCountsPerRevExact = 271.15F;
+
+// One entry per encoder edge. 12000 edges = about 2.2 s at full speed, 8 s at 5 Hz.
+constexpr size_t kCaptureCapacity = 12000;
+constexpr size_t kDutyEventCapacity = 2000;
 
 constexpr uint32_t kRateIntervalMs = 500;
 constexpr uint32_t kDisplayIntervalMs = 200;
@@ -65,16 +74,60 @@ uint32_t g_kickUntilMs = 0;
 uint8_t g_stallWindows = 0;
 uint32_t g_lastDisplayAtMs = 0;
 
+// Coast PWM (off-time = both LOW) never applies braking torque, so a low-duty half turn
+// barely slows the crank. Brake PWM (off-time = both HIGH) shorts the motor instead.
+bool g_brakePwm = false;
+
+bool g_profileEnabled = false;
+uint8_t g_profileHighDuty = 0;
+uint8_t g_profileLowDuty = 0;
+
+struct EdgeSample {
+  uint32_t tUs;
+  int32_t count;
+};
+struct DutyEvent {
+  uint32_t tUs;
+  uint8_t duty;
+};
+EdgeSample g_edges[kCaptureCapacity];
+DutyEvent g_dutyEvents[kDutyEventCapacity];
+volatile bool g_capturing = false;
+volatile size_t g_edgeCount = 0;
+size_t g_dutyEventCount = 0;
+uint32_t g_captureStartUs = 0;
+
 const char* directionName(Direction direction) {
   return direction == Direction::Forward ? "FWD" : "REV";
 }
 
+void recordDuty(uint8_t duty) {
+  if (g_capturing && g_dutyEventCount < kDutyEventCapacity) {
+    g_dutyEvents[g_dutyEventCount++] = {micros(), duty};
+  }
+}
+
 void releaseMotor() {
+  recordDuty(0);
   ledcWrite(kMotorForwardPwmChannel, 0);
   ledcWrite(kMotorReversePwmChannel, 0);
 }
 
 void writeMotor(uint8_t duty) {
+  recordDuty(duty);
+  if (g_brakePwm) {
+    // Hold the driving input HIGH and PWM the other one inverted: LOW drives, HIGH brakes.
+    // ledcWrite(255) is full on with 8-bit resolution, so the held input never drops.
+    const uint8_t brakeDuty = static_cast<uint8_t>(255U - duty);
+    if (g_direction == Direction::Forward) {
+      ledcWrite(kMotorForwardPwmChannel, 255);
+      ledcWrite(kMotorReversePwmChannel, brakeDuty);
+    } else {
+      ledcWrite(kMotorReversePwmChannel, 255);
+      ledcWrite(kMotorForwardPwmChannel, brakeDuty);
+    }
+    return;
+  }
   if (g_direction == Direction::Forward) {
     ledcWrite(kMotorReversePwmChannel, 0);
     ledcWrite(kMotorForwardPwmChannel, duty);
@@ -107,6 +160,10 @@ void updateRamp(uint32_t nowMs) {
     return;  // Hold the kick duty.
   }
 
+  if (g_running && g_profileEnabled && !reversing && g_appliedDuty > 0) {
+    return;  // updateProfile() owns the duty; ramping would smear the switching.
+  }
+
   if (g_appliedDuty == 0 && target > 0) {
     g_appliedDuty = kKickDuty;
     g_kickUntilMs = nowMs + kKickMs;
@@ -128,6 +185,24 @@ void updateRamp(uint32_t nowMs) {
     releaseMotor();
   } else {
     writeMotor(g_appliedDuty);
+  }
+}
+
+int32_t encoderCountSnapshot();
+
+// Switch the duty by crank angle. Angle 0 is where the count was last reset (boot or "z").
+void updateProfile(uint32_t nowMs) {
+  if (!g_running || !g_profileEnabled || g_requestedDirection != g_direction ||
+      g_appliedDuty == 0 || static_cast<int32_t>(nowMs - g_kickUntilMs) < 0) {
+    return;
+  }
+
+  float turns = static_cast<float>(encoderCountSnapshot()) / kEncoderCountsPerRevExact;
+  turns -= floorf(turns);
+  const uint8_t duty = turns < 0.5F ? g_profileHighDuty : g_profileLowDuty;
+  if (duty != g_appliedDuty) {
+    g_appliedDuty = duty;
+    writeMotor(duty);
   }
 }
 
@@ -163,10 +238,52 @@ void IRAM_ATTR updateEncoder() {
   const uint8_t transition =
       static_cast<uint8_t>((g_previousEncoderState << 2U) | currentState);
 
+  const int8_t step = kQuadratureTransitions[transition];
+
   portENTER_CRITICAL_ISR(&g_encoderMux);
-  g_encoderCount += kQuadratureTransitions[transition];
+  g_encoderCount += step;
   g_previousEncoderState = currentState;
+  if (step != 0 && g_capturing) {
+    if (g_edgeCount < kCaptureCapacity) {
+      g_edges[g_edgeCount++] = {micros(), g_encoderCount};
+    } else {
+      g_capturing = false;
+    }
+  }
   portEXIT_CRITICAL_ISR(&g_encoderMux);
+}
+
+void startCapture() {
+  portENTER_CRITICAL(&g_encoderMux);
+  g_edgeCount = 0;
+  g_dutyEventCount = 0;
+  g_captureStartUs = micros();
+  g_capturing = true;
+  portEXIT_CRITICAL(&g_encoderMux);
+  recordDuty(g_appliedDuty);
+  Serial.println("[CAPTURE] start");
+}
+
+void dumpCapture() {
+  portENTER_CRITICAL(&g_encoderMux);
+  g_capturing = false;
+  const size_t edgeCount = g_edgeCount;
+  portEXIT_CRITICAL(&g_encoderMux);
+
+  Serial.printf("[DUMP] edges=%u duty_events=%u counts_per_rev=%.2f\n",
+                static_cast<unsigned>(edgeCount), static_cast<unsigned>(g_dutyEventCount),
+                kEncoderCountsPerRevExact);
+  Serial.println("kind,t_us,value");
+  for (size_t i = 0; i < g_dutyEventCount; ++i) {
+    Serial.printf("duty,%lu,%u\n",
+                  static_cast<unsigned long>(g_dutyEvents[i].tUs - g_captureStartUs),
+                  g_dutyEvents[i].duty);
+  }
+  for (size_t i = 0; i < edgeCount; ++i) {
+    Serial.printf("edge,%lu,%ld\n", static_cast<unsigned long>(g_edges[i].tUs - g_captureStartUs),
+                  static_cast<long>(g_edges[i].count));
+  }
+  Serial.println("[DUMP END]");
 }
 
 void updateEncoderRate(uint32_t nowMs) {
@@ -226,10 +343,33 @@ void handleSerial() {
     portEXIT_CRITICAL(&g_encoderMux);
     g_previousRateCount = 0;
     Serial.println("[ENCODER] count reset");
+  } else if (command == 'p') {
+    int high = 0;
+    int low = 0;
+    if (sscanf(line.c_str(), "p %d %d", &high, &low) == 2) {
+      g_profileHighDuty = static_cast<uint8_t>(constrain(high, 0, 255));
+      g_profileLowDuty = static_cast<uint8_t>(constrain(low, 0, 255));
+      g_profileEnabled = true;
+      Serial.printf("[PROFILE] on high=%u low=%u\n", g_profileHighDuty, g_profileLowDuty);
+    } else {
+      g_profileEnabled = false;
+      Serial.println("[PROFILE] off");
+    }
+  } else if (command == 'b') {
+    g_brakePwm = line.endsWith("1");
+    if (g_appliedDuty > 0) {
+      writeMotor(g_appliedDuty);
+    }
+    Serial.printf("[PWM] %s\n", g_brakePwm ? "brake" : "coast");
+  } else if (command == 'c') {
+    startCapture();
+  } else if (command == 'd') {
+    dumpCapture();
   } else if (isDigit(command)) {
     setDuty(static_cast<uint8_t>(constrain(line.toInt(), 0, 255)));
   } else {
-    Serial.println("[HELP] g=run s=stop f/r=direction z=reset count 0..255=duty");
+    Serial.println("[HELP] g=run s=stop f/r=direction z=reset count 0..255=duty "
+                   "p HI LO=half-turn profile b 0/1=coast/brake PWM c=capture d=dump");
   }
 }
 
@@ -318,8 +458,13 @@ void loop() {
 
   const uint32_t nowMs = millis();
   updateRamp(nowMs);
+  updateProfile(nowMs);
   updateEncoderRate(nowMs);
 
+  // Redrawing takes milliseconds, which would delay the profile switching.
+  if (g_capturing || g_profileEnabled && g_running) {
+    return;
+  }
   if (nowMs - g_lastDisplayAtMs >= kDisplayIntervalMs) {
     g_lastDisplayAtMs = nowMs;
     drawStatus();
